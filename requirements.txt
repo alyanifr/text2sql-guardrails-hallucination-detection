@@ -3,3 +3,4 @@ SQLAlchemy
 crewai
 crewai-tools
 psycopg2-binary
+sqlparse
