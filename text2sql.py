@@ -55,7 +55,7 @@ def crew_task_callback(task_output: Any) -> None:
 hf_llm = LLM(
     model="huggingface/Qwen/Qwen3-32B",
     temperature=0.0,     # deterministic SQL generation
-    hf_token=os.getenv('HF_TOKEN')
+    api_key=os.getenv('HF_TOKEN')
 )
 
 # ----- Initialized guardrails keywords ----- #
