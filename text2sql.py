@@ -7,12 +7,12 @@ from typing import Any
 from textwrap import dedent
 
 import pandas as pd
-import sqlite3
 import sqlparse 
 from sqlparse.tokens import Keyword
 from sqlalchemy import create_engine, text, inspect
 from crewai import Agent, LLM, Task, Crew, Process
 from crewai.tools import tool
+from setup_database import setup_database
 
 # ----- Configure logger ----- #
 AUDIT_LOG_FILE = "audit.log"
@@ -51,17 +51,6 @@ def crew_task_callback(task_output: Any) -> None:
         },
     )
 
-# ----- Load data into database ----- #
-df = pd.read_csv("data/ai_job_market_insights.csv")
-print("Dataframe is ready:")
-#print(df.head())
-
-conn = sqlite3.connect("job_insights.db")
-print("Connection to database is created.")
-
-df.to_sql(name="job_insights", con=conn, if_exists="replace", index=False)
-print("Database is created for experimentation.")
-
 # ----- Define LLM ----- #
 hf_llm = LLM(
     model="huggingface/Qwen/Qwen3-32B",
@@ -69,11 +58,8 @@ hf_llm = LLM(
     hf_token=os.getenv('HF_TOKEN')
 )
 
-# ----- Initialized guardrails and engine ----- #
-engine = create_engine("sqlite+pysqlite:///job_insights.db", echo=True)
-print("Connectivity to the database is established.")
-
-MAX_ROW_LIMITS = 100
+# ----- Initialized guardrails keywords ----- #
+MAX_ROW_LIMITS = 50     # cut tokens usage
 FORBIDDEN_KEYWORDS = {
     "CREATE",
     "ALTER",
@@ -91,43 +77,36 @@ FORBIDDEN_KEYWORDS = {
 
 # ----- SQL syntax validation with sqlparse ----- #
 # Validation function
-def validate_sql_syntax(sql_query: str) -> str:
+def validate_sql_syntax(sql_query: str) -> tuple[bool, str]:
     """Validates that the SQL query is a single, well-formed, read-only SELECT statement.
        This function acts as the first layer of guiderails to prevent destructive queries."""
     if not sql_query or not sql_query.strip():
-        return "Query is empty."
+        return False, "Query is empty."
 
     # Parse the SQL string into individual statements
     parsed_statements = sqlparse.parse(sql_query.strip())
 
     # Block multiple or stacked queries. Prevents SQL injection chaining.
     if len(parsed_statements) != 1:
-        return "Only a single SQL statement is allowed per execution."
+        return False, "Only a single SQL statement is allowed per execution."
 
     statement = parsed_statements[0]
 
     # Verify top-vele statement type is SELECT
     if statement.get_type() != "SELECT":
-        return f"operation '{statement.get_type()} is forbidden. Only SELECT queries are permitted."
+        return False, f"operation '{statement.get_type()}' is forbidden. Only SELECT queries are permitted."
 
     # Catch possible subqueries hiding write operations
     for token in statement.flatten():
-        if token.ttype in Keyword or FORBIDDEN_KEYWORDS:
+        if token.ttype in Keyword or token.ttype in Keyword.DML:
             if token.value.upper() in FORBIDDEN_KEYWORDS:
-                return f"Forbidden SQL keyword detected: '{token.value.upper()}'"
+                return False, f"Forbidden SQL keyword detected: '{token.value.upper()}'"
 
-    # Structural checks for unclosed parenthesis and quotes.
-    open_parens = sum(1 for t in statement.flatten() if t.value == "(" and not t.is_whitespace)
-    close_parens = sum(1 for t in statement.flatten() if t.value == "(" and not t.is_whitespace)
-
-    if open_parens != close_parens:
-        return "Syntax Error: Unbalanced parentheses in query."
-
-    return "Valid"
+    return True, "Valid"
 
 # ----- Schema inspection ----- #
-@tool("database schema")
-def database_schema() -> str:
+@tool("get database schema")
+def get_database_schema() -> str:
     """Returns a comma-separated list of all table names and columns in the database."""
     inspector = inspect(engine)
     schema_info = []
@@ -147,11 +126,10 @@ def database_schema() -> str:
 @tool("execute_query")
 def execute_query(sql_query: str) -> str:
     """Validates SQL syntax and executes read-only SELECT query against the database."""
-    timestamp = datetime.now(timezone.utc).isoformat()
+    #timestamp = datetime.now(timezone.utc).isoformat()
     cleaned_query = sqlparse.format(sql_query, strip_comments=True, keyword_case="upper").strip()
 
     audit_record: dict[str, Any] = {
-        "timestamp_utc": timestamp,
         "raw_query": sql_query,
         "cleaned_query": cleaned_query,
         "status": "PENDING",
@@ -178,7 +156,8 @@ def execute_query(sql_query: str) -> str:
 
             # Measure query execution & dataframe load time
             start_time = time.perf_counter()
-            df = pd.read_sql_query(text(cleaned_query), conn)
+            df = pd.read_sql_query(text(f"SELECT * FROM ({cleaned_query.rstrip(';')}) LIMIT {MAX_ROW_LIMITS + 1}"), conn)       # Max row limits + truncation flag
+            #df = pd.read_sql_query(text(cleaned_query), conn)
             elapsed_ms = round((time.perf_counter() - start_time) * 1000, 2)
 
         total_rows = len(df)
@@ -240,13 +219,13 @@ sql_dev = Agent(
         You are a database engineer with more than 10 years of professional experience,
         a master at creating efficient SQL queries for complex request.
         You have a deep understanding of how different databases work and how to optimize quaries.
-        You have a habit of always inspecting the database schema by using 'database schema',
+        You have a habit of always inspecting the database schema by using 'get_database_schema',
         to be sure the tables and columns actually exist. You would also validate the SQL queries,
         before executing them against the database using 'execute_query'.
         """
     ),
     llm=hf_llm,
-    tools=[database_schema, execute_query],
+    tools=[get_database_schema, execute_query],
     verbose=True,
     allow_delegation=False,
 )
@@ -279,15 +258,15 @@ data_analyst = Agent(
 extract_data = Task(
     description=dedent(
         """
-        1. Use 'database schema' to examine the available tables and columns.
+        1. Use 'get_database_schema' to examine the available tables and columns.
         2. Write clean, read-only SELECT query to answer: '{user_question}'.
-        3. Execute the query using 'execute query' and return the complete JSON response
+        3. Execute the query using 'execute_query' and return the complete JSON response
         containing the results, row counts, and execution time.
         """
     ),
     expected_output=dedent(
         """
-        The full structured JSON payload returned by 'execute query',
+        The full structured JSON payload returned by 'execute_query',
         preserving all metadata and result rows.
         """
     ),
@@ -320,13 +299,14 @@ crew = Crew(
     tasks=[extract_data, analyze_data],
     process=Process.sequential,
     verbose=True,
-    memory=True,
+    memory=False,
     step_callback=crew_step_callback,
     task_callback=crew_task_callback,
 )
 
 # ----- Execution entry point ----- #
 if __name__ == "__main__":
+    engine = setup_database()
     user_query = input()
     log_audit_event("CREW_RUN_STARTED", {
         "user_question": user_query,
