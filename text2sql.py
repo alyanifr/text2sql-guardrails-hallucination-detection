@@ -54,8 +54,9 @@ def crew_task_callback(task_output: Any) -> None:
 # ----- Define LLM ----- #
 hf_llm = LLM(
     model="huggingface/Qwen/Qwen3-32B",
+    api_key=os.getenv('HF_TOKEN'),
     temperature=0.0,     # deterministic SQL generation
-    api_key=os.getenv('HF_TOKEN')
+    extra_body={"chat_template_kwargs": {"enable_thinking": False}}     # to avoid breaking sql execution parser
 )
 
 # ----- Initialized guardrails keywords ----- #
@@ -220,8 +221,8 @@ sql_dev = Agent(
         a master at creating efficient SQL queries for complex request.
         You have a deep understanding of how different databases work and how to optimize quaries.
         You have a habit of always inspecting the database schema by using 'get_database_schema',
-        to be sure the tables and columns actually exist. You would also validate the SQL queries,
-        before executing them against the database using 'execute_query'.
+        to be sure the tables and columns actually exist. You would validate the SQL queries,
+        before executing them against the database using 'execute_query'. 
         """
     ),
     llm=hf_llm,
@@ -305,9 +306,14 @@ crew = Crew(
 )
 
 # ----- Execution entry point ----- #
-if __name__ == "__main__":
+def main() -> None:
+    global engine
     engine = setup_database()
-    user_query = input()
+    user_query = input("Ask a question: ").strip()
+
+    if not user_query:
+        return
+
     log_audit_event("CREW_RUN_STARTED", {
         "user_question": user_query,
         "agents": [a.role for a in crew.agents],
@@ -329,3 +335,6 @@ if __name__ == "__main__":
     except Exception as e:
         log_audit_event("CREW_RUN_FAILED", {"status": "ERROR", "error": str(e)})
         raise
+
+if __name__ == "__main__":
+    main()

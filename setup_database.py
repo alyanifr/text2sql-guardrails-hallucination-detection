@@ -1,5 +1,6 @@
 import logging
 from pathlib import Path
+from urllib.parse import quote
 
 import pandas as pd
 from sqlalchemy import create_engine, text
@@ -36,10 +37,10 @@ def setup_database(csv_path: Path = CSV_PATH, db_path: Path = DB_PATH, table_nam
             df.to_sql(name=table_name, con=conn, if_exists="replace", index=False)
     finally:
         writer.dispose()
-    logger.info("Table '%s' craeted in %s", table_name, db_path)
+    logger.info("Table '%s' created in %s", table_name, db_path)
 
     # Read-only engine for agents
-    reader = create_engine(f"sqlite+pysqlite://file:{db_path.resolve()}?mode=ro&uri=true", echo=echo)
+    reader = create_engine(f"sqlite+pysqlite:///file:{quote(str(db_path.resolve()))}?mode=ro&uri=true", echo=echo)
 
     # Sanity checks: Table is readable and writes are rejected
     with reader.connect() as conn:
